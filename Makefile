@@ -4,7 +4,10 @@ TOP_MODULE  = nand_gate
 OBJ_DIR     = obj
 BIN         = $(OBJ_DIR)/V$(TOP_MODULE)
 
-VERILATOR_FLAGS = --cc --exe --trace --build -CFLAGS "-std=c++20 -g -O0" --compiler clang
+INCLUDES        = -isystem $(CURDIR)/HtLib -I$(CURDIR)/$(WL_BUILD)
+FLAGS           =
+CXX             = clang++
+VERILATOR_FLAGS = --cc --exe --trace --build --Mdir $(OBJ_DIR) -CFLAGS "-std=c++20 -g -O0 $(FLAGS) $(INCLUDES)" -MAKEFLAGS "CXX=$(CXX)" --compiler clang
 
 PROTO_DIR   = /usr/share/wayland-protocols/stable/xdg-shell
 WL_BUILD    = build

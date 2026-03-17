@@ -1,4 +1,7 @@
 #include <cstdio>
+#include <cstring>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include <wayland-client.h>
 
@@ -7,6 +10,16 @@
 #include "Vnand_gate.h"
 #include "verilated.h"
 #include "verilated_vcd_c.h"
+
+#include <ht_error.h>
+
+struct framebuffer_t
+{
+    wl_buffer* wlBuf;
+    u8*        data;
+    u32        busy;
+};
+
 
 struct wl_context
 {
@@ -18,9 +31,13 @@ struct wl_context
     xdg_wm_base*    xdgBase;
     xdg_surface*    xdgSurf;
     xdg_toplevel*   xdgTop;
+    framebuffer_t*  fbos;
+    u32             fboCount : 16  
+    u32             running : 1;
+    u32             state : 15;
 };
 
-static void XdgSurfConfig( void *data, struct xdg_surface *surf, uint32_t serial ) 
+static void XdgSurfConfig( void* data, struct xdg_surface* surf, u32 serial ) 
 {
     xdg_surface_ack_configure( surf, serial );
 }
@@ -29,8 +46,12 @@ static const struct xdg_surface_listener xdgSurfListener = {
     .configure = XdgSurfConfig,
 };
  
-static void XdgTopConfig( void *d, xdg_toplevel *t, int32_t w, int32_t h, wl_array *s ) {}
-static void XdgTopClose( void *d, xdg_toplevel *t ) { running = 0; }
+static void XdgTopConfig( void* data, xdg_toplevel* t, i32 w, i32 h, wl_array* s ) {}
+static void XdgTopClose( void* data, xdg_toplevel* t ) 
+{ 
+    wl_context* wlCtx = ( wl_context* ) data;
+    wlCtx->running = 0;
+}
  
 static const struct xdg_toplevel_listener xdgTopListener = {
     .configure = XdgTopConfig,
@@ -39,7 +60,7 @@ static const struct xdg_toplevel_listener xdgTopListener = {
  
 // --- xdg_wm_base ping/pong (mandatory or compositor kills you) ---
  
-static void XdgBasePing( void *d, xdg_wm_base *base, uint32_t serial ) 
+static void XdgBasePing( void* data, xdg_wm_base* base, u32 serial ) 
 {
     xdg_wm_base_pong( base, serial );
 }
@@ -48,21 +69,21 @@ static const struct xdg_wm_base_listener xdgBaseListener = {
     .ping = XdgBasePing,
 };
  
-static void WlRegGlobal( void *d, wl_registry *reg, uint32_t name, const char *iface, uint32_t ver ) 
+static void WlRegGlobal( void* data, wl_registry* reg, u32 name, const char* iface, u32 ver ) 
 {
-    wl_context* wlCtx = ( wl_context* ) d;
+    wl_context* wlCtx = ( wl_context* ) data;
 
     if( !strcmp( iface, wl_compositor_interface.name ) )
     {
-        wlCtx->compositor = wl_registry_bind( reg, name, &wl_compositor_interface, 4 );
+        wlCtx->compositor = ( wl_compositor* ) wl_registry_bind( reg, name, &wl_compositor_interface, 4 );
     }
     else if( !strcmp( iface, wl_shm_interface.name ) )
     {
-        wlCtx->shm = wl_registry_bind( reg, name, &wl_shm_interface, 1 );
+        wlCtx->shm = ( wl_shm* ) wl_registry_bind( reg, name, &wl_shm_interface, 1 );
     }
-    else if( !strcmp( iface, xdg_wm_base_interface.name ) ) 
+    else if( !strcmp( iface, xdg_wm_base_interface.name ) )
     {
-        wlCtx->xdgBase = wl_registry_bind( reg, name, &xdg_wm_base_interface, 1 );
+        wlCtx->xdgBase = ( xdg_wm_base* ) wl_registry_bind( reg, name, &xdg_wm_base_interface, 1 );
         xdg_wm_base_add_listener( wlCtx->xdgBase, &xdgBaseListener, NULL );
     }
 }
@@ -92,26 +113,20 @@ void WlInitCtx( wl_context* wlCtx )
     wlCtx->xdgSurf = xdg_wm_base_get_xdg_surface( wlCtx->xdgBase, wlCtx->surface );
     HT_ASSERT( wlCtx->xdgSurf );
 
-    xdg_surface_add_listener( wlCtx->xdgSurf, &xdgSurfListener, NULL );
+    xdg_surface_add_listener( wlCtx->xdgSurf, &xdgSurfListener, wlCtx );
     wlCtx->xdgTop  = xdg_surface_get_toplevel(wlCtx->xdgSurf);
-    HT_ASSERT( wlCtx->xdgSxdgTopurf );
+    HT_ASSERT( wlCtx->xdgTop );
 
-    xdg_toplevel_add_listener( wlCtx->xdgTop, &xdgTopListener, NULL );
+    xdg_toplevel_add_listener( wlCtx->xdgTop, &xdgTopListener, wlCtx );
  
     wl_surface_commit( wlCtx->surface );
     wl_display_roundtrip( wlCtx->display );
+
+    wlCtx->running = 1;
 }
 
-struct framebuffer
-{
-    wl_buffer*      wlBuf;
-    uint8_t*        data;
-    uint32_t        busy;
-};
-
-
 // WL callbacks
-static void WlFramebufferRelease( void *data, wl_buffer *wlBuf )  
+static void WlFramebufferRelease( void* data, wl_buffer* wlBuf )  
 {
     ( ( framebuffer* ) data )->busy = 0;
 }
@@ -120,7 +135,7 @@ static const wl_buffer_listener wlBuffListener = {
     .release = WlFramebufferRelease,
 };
 
-static uint32_t PixelPitchFromFmt( uint32_t fmt )
+static u32 PixelPitchFromFmt( u32 fmt )
 {
     switch( fmt )
     {
@@ -140,30 +155,35 @@ static uint32_t PixelPitchFromFmt( uint32_t fmt )
     }
 }
 
-static void CreateFrameBuffers( uint64_t width, uint64_t height, uint32_t fmt, uint64_t nBuffering ) 
+static void CreateFrameBuffers( wl_context* pWlCtx, u64 width, u64 height, u32 fmt, u64 nBuffering ) 
 {
-    uint64_t pixelPitch     = PixelPitchFromFmt( fmt );
-    uint64_t stride         = width * pixelPitch;
-    uint64_t fboSzInBytes   = stride * height;
-    uint64_t totalSzInBytes = fboSzInBytes * nBuffering;
+    u64 pixelPitch      = PixelPitchFromFmt( fmt );
+    u64 stride          = width * pixelPitch;
+    u64 fbSzInBytes     = stride * height;
+    u64 totalSzInBytes  = fbSzInBytes * nBuffering;
  
-    int32_t fileDesc        = memfd_create( "fb", MFD_CLOEXEC );
+    i32 fileDesc        = memfd_create( "fb", MFD_CLOEXEC );
+    HT_ASSERT( fileDesc >= 0 );
     ftruncate( fileDesc, totalSzInBytes );
- 
-    uint8_t* poolData       = mmap( NULL, totalSzInBytes, PROT_READ | PROT_WRITE,
-                     MAP_SHARED | MAP_NORESERVE, fileDesc, 0 );
- 
-    wl_shm_pool* wlPool     = wl_shm_create_pool( shm, fileDesc, totalSzInBytes );
- 
-    for( uint32_t fboi = 0; fboi < nBuffering; fboi++ ) 
+    
+    u32 protPerms       = PROT_READ | PROT_WRITE;
+    u32 mmapFlags       = MAP_SHARED | MAP_NORESERVE;
+    u8* poolData        = ( u8* ) mmap( NULL, totalSzInBytes, protPerms, mmapFlags, fileDesc, 0 );
+    HT_ASSERT( poolData );
+
+    wl_shm_pool* wlPool = wl_shm_create_pool( pWlCtx->shm, fileDesc, totalSzInBytes );
+    HT_ASSERT( wlPool );
+    for( u32 fboi = 0; fboi < nBuffering; fboi++ ) 
     {
-        uint32_t currBuffOffsetInBytes = fboi * fboSzInBytes;
-        wl_buffer* wlBuf = wl_shm_pool_create_buffer( wlPool, currBuffOffsetInBytes, width, 
+        u32 currOffsetInBytes = fboi * fbSzInBytes;
+        wl_buffer* wlBuf = wl_shm_pool_create_buffer( wlPool, currOffsetInBytes, width, 
             height, stride, fmt );
+        
+        HT_ASSERT( wlBuf );
 
         buffers[ fboi ] = {
             .wlBuf = wlBuf,
-            .data  = poolDta + currBuffOffsetInBytes,
+            .data  = poolData + currOffsetInBytes,
             .busy  = 0
         }
         wl_buffer_add_listener( buffers[ fboi ].wlBuf, &wlBuffListener, &buffers[ fboi ] );
@@ -176,12 +196,12 @@ static void CreateFrameBuffers( uint64_t width, uint64_t height, uint32_t fmt, u
 
 struct nand_state
 {
-    uint32_t a : 1;
-    uint32_t b : 1;
-    uint32_t expected : 1;
+    u32 a : 1;
+    u32 b : 1;
+    u32 expected : 1;
 };
 
-int main( int argc, char** argv)
+int main( i32 argc, char** argv)
 {
     wl_context wlCtx;
     WlInitCtx( &wlCtx );
@@ -201,10 +221,10 @@ int main( int argc, char** argv)
         {1, 1, 0},
     };
 
-    uint64_t tick = 0;
-    uint32_t failures = 0;
+    u64 tick = 0;
+    u32 failures = 0;
 
-    for( uint32_t i = 0; i < 4; i++ ) 
+    for( u32 i = 0; i < 4; i++ ) 
     {
         dut.a = tests[ i ].a;
         dut.b = tests[ i ].b;
