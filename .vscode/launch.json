@@ -5,7 +5,7 @@
             "name": "Debug Testbench",
             "type": "lldb",
             "request": "launch",
-            "program": "${workspaceFolder}/obj_dir/Vnand_gate",
+            "program": "${workspaceFolder}/obj/Vnand_gate",
             "cwd": "${workspaceFolder}",
             "preLaunchTask": "Build"
         }

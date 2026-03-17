@@ -3,9 +3,11 @@
 #ifndef __SYS_MEM_ARENA_H__
 #define __SYS_MEM_ARENA_H__
 
+#include <new>
 #include <memory_resource>
 
-#include "core_types.h"
+#include "ht_core_types.h"
+#include "ht_cpp.h"
 #include "ht_error.h"
 #include "ht_utils.h"
 
@@ -78,6 +80,23 @@ struct virtual_arena
     void*   Alloc( u64 bytes, u64 alignment );
 };
 
+inline virtual_arena::virtual_arena( virtual_arena&& o )
+	: base{ Exchange( o.base, (u8*) nullptr ) }
+	, offset{ Exchange( o.offset, (u64) 0 ) }
+	, committed{ Exchange( o.committed, (u64) 0 ) }
+	, reserved{ Exchange( o.reserved, (u64) 0 ) }
+{}
+
+inline virtual_arena& virtual_arena::operator=( virtual_arena&& o )
+{
+	HT_ASSERT( this != &o && "self move-assign" );
+	base      = Exchange( o.base, (u8*) nullptr );
+	offset    = Exchange( o.offset, (u64) 0 );
+	committed = Exchange( o.committed, (u64) 0 );
+	reserved  = Exchange( o.reserved, (u64) 0 );
+	return *this;
+}
+
 template<typename T>
 concept arena_t = requires( T a, u64 bytes, u64 alignment, u64 mark )
 {
@@ -86,6 +105,18 @@ concept arena_t = requires( T a, u64 bytes, u64 alignment, u64 mark )
 	{ a.Reset() }					-> std::same_as<void>;
 	{ a.offset }					-> std::convertible_to<u64>;
 };
+
+template<typename T, arena_t Arena>
+T* ArenaNew( Arena& arena )
+{
+	return new ( arena.Alloc( sizeof( T ), alignof( T ) ) ) T;
+}
+
+template<typename T, arena_t Arena>
+T* ArenaNewArray( Arena& arena, u64 count )
+{
+	return new ( arena.Alloc( sizeof( T ) * count, alignof( T ) ) ) T[count];
+}
 
 template<arena_t Arena>
 struct stack_adaptor : std::pmr::memory_resource

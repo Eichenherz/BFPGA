@@ -22,22 +22,6 @@ virtual_arena::~virtual_arena()
 	}
 }
 
-virtual_arena::virtual_arena( virtual_arena&& o )
-    : base{ std::exchange( o.base, nullptr ) }
-    , offset{ std::exchange( o.offset, 0 ) }
-    , committed{ std::exchange( o.committed, 0 ) }
-    , reserved{ std::exchange( o.reserved, 0 ) }
-{}
-
-virtual_arena& virtual_arena::operator=( virtual_arena&& o )
-{
-    HT_ASSERT( this != &o && "self move-assign" );
-    base      = std::exchange( o.base, nullptr );
-    offset    = std::exchange( o.offset, 0 );
-    committed = std::exchange( o.committed, 0 );
-    reserved  = std::exchange( o.reserved, 0 );
-    return *this;
-}
 
 void virtual_arena::Rewind( u64 mark ) 
 {

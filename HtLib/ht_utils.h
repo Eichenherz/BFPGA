@@ -28,7 +28,7 @@ inline u64 FloorPowOf2( u64 size )
 {
 	// NOTE: use Hacker's Delight for bit-tickery
 	constexpr u64 ONE_LEFT_MOST = u64( 1ULL << ( sizeof( u64 ) * 8 - 1 ) );
-	return ( size ) ? ONE_LEFT_MOST >> __lzcnt64( size ) : 0;
+	return ( size ) ? ONE_LEFT_MOST >> std::countl_zero( size ) : 0;
 }
 inline u32 GetImgMipCount( u32 width, u32 height, u32 mipLevels )
 {

@@ -3,7 +3,7 @@
         {
             "name": "Linux",
             "includePath": [
-                "${workspaceFolder}/obj_dir",
+                "${workspaceFolder}/obj",
                 "/usr/share/verilator/include"
             ],
             "compilerPath": "/usr/bin/clang++",
