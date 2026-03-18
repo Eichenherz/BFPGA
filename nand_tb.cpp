@@ -8,7 +8,7 @@
 
 #include "xdg-shell-client-protocol.h"
 
-#include "Vnand_gate.h"
+#include "display_driver/Vdisplay_driver.h"
 #include "verilated.h"
 #include "verilated_vcd_c.h"
 
@@ -16,22 +16,62 @@
 #include <ht_mem_arena.h>
 #include <ht_utils.h>
 
+// TODO: add "swizzle mask"
 struct framebuffer_t
 {
-    wl_buffer*  wlBuf;
     u8*         data;
     u64         width       : 16;
     u64         height      : 16;
     u64         pixelPitch  : 8;
-    u64         busy        : 1;
-    u64         padding     : 23;
+    u64         padding     : 24;
 };
 
 void FboClear( framebuffer_t* pFbo, u32 clearVal )
 {
-    u64 buffSz = pFbo->width * pFbo->pixelPitch * pFbo->height;
-    memset( pFbo->data, clearVal, buffSz );  
+    u64 pixelCount = pFbo->width * pFbo->height;
+    u32* pPixels   = ( u32* ) pFbo->data;
+    for( u64 pi = 0; pi < pixelCount; pi++ )
+    {
+        pPixels[ pi ] = clearVal;
+    }
 }
+
+void FboCopyData( framebuffer_t* pDst, framebuffer_t* pSrc )
+{
+    HT_ASSERT( pDst->width == pSrc->width );
+    HT_ASSERT( pDst->height == pSrc->height );
+    HT_ASSERT( pDst->pixelPitch == pSrc->pixelPitch );
+    u64 buffSz = pSrc->width * pSrc->pixelPitch * pSrc->height;
+    memcpy( pDst->data, pSrc->data, buffSz );
+}
+
+framebuffer_t CreateFbo(
+    virtual_arena*  pArena, 
+    u64             width, 
+    u64             height, 
+    u64             pixelPitch
+) {
+    u64 stride          = width * pixelPitch;
+    u64 fbSzInBytes     = stride * height;
+
+    framebuffer_t fbo   = {
+        .data = ArenaNewArray<u8>( *pArena, fbSzInBytes ),
+        .width = width,
+        .height = height,
+        .pixelPitch = pixelPitch
+    };
+
+    FboClear( &fbo, 0 );
+    return fbo;
+}
+
+
+struct wl_fbo_t
+{
+    framebuffer_t   fbo;
+    wl_buffer*      wlBuf;
+    u32             busy;
+};
 
 struct wl_context
 {
@@ -39,12 +79,16 @@ struct wl_context
     wl_registry*    registry;
     wl_compositor*  compositor;
     wl_shm*         shm;
+    wl_shm_pool*    shmPool;
     wl_surface*     surface;
     xdg_wm_base*    xdgBase;
     xdg_surface*    xdgSurf;
     xdg_toplevel*   xdgTop;
-    framebuffer_t*  fbos;
-    u32             fboCount : 16;  
+    wl_fbo_t*       fbos;
+    u8*             poolData;
+    u64             poolSz;
+    i32             poolFd;
+    u32             fboCount : 16;
     u32             running : 1;
     u32             state : 15;
 };
@@ -142,10 +186,10 @@ void WlInitCtx( wl_context* wlCtx )
 }
 
 // WL callbacks
-static void WlFramebufferRelease( void* data, wl_buffer* wlBuf )  
+static void WlFramebufferRelease( void* data, wl_buffer* wlBuf )
 {
-    framebuffer_t* fbo = ( framebuffer_t* ) data;
-    fbo->busy = 0;
+    wl_fbo_t* pFbo = ( wl_fbo_t* ) data;
+    pFbo->busy = 0;
 }
  
 static const wl_buffer_listener wlBuffListener = {
@@ -194,33 +238,33 @@ static void WlCreateFrameBuffers(
     u8* poolData        = ( u8* ) mmap( NULL, totalSzInBytes, protPerms, mmapFlags, fileDesc, 0 );
     HT_ASSERT( poolData );
 
-    wl_shm_pool* wlPool = wl_shm_create_pool( pWlCtx->shm, fileDesc, totalSzInBytes );
-    HT_ASSERT( wlPool );
+    pWlCtx->poolData    = poolData;
+    pWlCtx->poolFd      = fileDesc;
+    pWlCtx->poolSz      = totalSzInBytes;
+    pWlCtx->shmPool     = wl_shm_create_pool( pWlCtx->shm, fileDesc, totalSzInBytes );
+    HT_ASSERT( pWlCtx->shmPool );
 
-    pWlCtx->fbos = ArenaNewArray<framebuffer_t>( *pArena, nBuffering );
-    pWlCtx->fboCount = nBuffering;
-    for( u32 fboi = 0; fboi < pWlCtx->fboCount; fboi++ ) 
+    pWlCtx->fboCount    = nBuffering;
+    pWlCtx->fbos        = ArenaNewArray<wl_fbo_t>( *pArena, pWlCtx->fboCount );
+
+    for( u32 fboi = 0; fboi < pWlCtx->fboCount; fboi++ )
     {
         u32 currOffsetInBytes = fboi * fbSzInBytes;
-        wl_buffer* wlBuf = wl_shm_pool_create_buffer( wlPool, currOffsetInBytes, width, 
-            height, stride, fmt );
-        
-        HT_ASSERT( wlBuf );
+        wl_fbo_t* pFbo = &pWlCtx->fbos[ fboi ];
 
-        pWlCtx->fbos[ fboi ] = {
-            .wlBuf      = wlBuf,
+        pFbo->fbo = {
             .data       = poolData + currOffsetInBytes,
             .width      = width,
             .height     = height,
-            .pixelPitch = pixelPitch,
-            .busy       = 0
+            .pixelPitch = pixelPitch
         };
-        wl_buffer_add_listener( pWlCtx->fbos[ fboi ].wlBuf, &wlBuffListener, 
-            &pWlCtx->fbos[ fboi ] );
-    }
+        pFbo->busy = 0;
 
-    wl_shm_pool_destroy( wlPool );
-    close( fileDesc );
+        pFbo->wlBuf = wl_shm_pool_create_buffer( pWlCtx->shmPool,
+            currOffsetInBytes, width, height, stride, fmt );
+        HT_ASSERT( pFbo->wlBuf );
+        wl_buffer_add_listener( pFbo->wlBuf, &wlBuffListener, pFbo );
+    }
 }
 
 bool WlPumpEvents( wl_context* pWlCtx )
@@ -246,101 +290,76 @@ bool WlPumpEvents( wl_context* pWlCtx )
     return pWlCtx->running;
 }
 
-framebuffer_t* WlGetNextFramebuffer( wl_context* pWlCtx )
+wl_fbo_t* WlGetNextFramebuffer( wl_context* pWlCtx )
 {
     for( u32 i = 0; i < pWlCtx->fboCount; i++ )
     {
-        framebuffer_t& fbo = pWlCtx->fbos[ i ];
-        if( !fbo.busy ) 
-        {
-            return &fbo;
-        }
+        if( !pWlCtx->fbos[ i ].busy ) return &pWlCtx->fbos[ i ];
     }
     return nullptr;
 }
 
-void WlIssuePresent( wl_context* pWlCtx, framebuffer_t* pFbo )
+void WlIssuePresent( wl_context* pWlCtx, wl_fbo_t* pFbo )
 {
     pFbo->busy = 1;
     wl_surface_attach( pWlCtx->surface, pFbo->wlBuf, 0, 0 );
-    wl_surface_damage_buffer( pWlCtx->surface, 0, 0, pFbo->width, pFbo->height );
+    wl_surface_damage_buffer( pWlCtx->surface, 0, 0, pFbo->fbo.width, pFbo->fbo.height );
     wl_surface_commit( pWlCtx->surface );
     wl_display_flush( pWlCtx->display );
 }
 
-struct nand_state
-{
-    u32 a : 1;
-    u32 b : 1;
-    u32 expected : 1;
-};
-
 int main( i32 argc, char** argv )
 {
-    virtual_arena mainArena = { 1 * GB };
+    virtual_arena mainArena = { 2 * GB };
 
     wl_context* pWlCtx = ArenaNew<wl_context>( mainArena );
     WlInitCtx( pWlCtx );
 
     WlCreateFrameBuffers( pWlCtx, &mainArena, 1024, 640, WL_SHM_FORMAT_XRGB8888, 3 );
 
-    for( ;; ) 
-    {
-        if( !WlPumpEvents( pWlCtx ) ) break;
-        
-
-        framebuffer_t* pFbo = WlGetNextFramebuffer( pWlCtx );
-        if( nullptr == pFbo ) continue; // NOTE: shouldn't hit this case with 3+ fbos
-        // === YOUR RENDER HERE ===
-
-        FboClear( pFbo, 0x40 ); // placeholder: dark grey
-        
-        WlIssuePresent( pWlCtx, pFbo );
-    }
 
     Verilated::commandArgs( argc, argv );
     Verilated::traceEverOn( true );
 
-    Vnand_gate dut;
+    Vdisplay_driver display;
     VerilatedVcdC trace;
-    dut.trace( &trace, 5 );
-    trace.open( "nand_tb.vcd" );
+    display.trace( &trace, 4 );
+    trace.open( "display_driver_tb.vcd" );
 
-    constexpr nand_state tests[] = {
-        {0, 0, 1},
-        {0, 1, 1},
-        {1, 0, 1},
-        {1, 1, 0},
-    };
+    // reset
+    display.simRst = 1;
+    display.clkPxl = 0;
+    display.eval();
+    display.clkPxl = 1;
+    display.eval();
+    display.simRst = 0;
+    display.clkPxl = 0;
+    display.eval();
 
-    u64 tick = 0;
-    u32 failures = 0;
-
-    for( u32 i = 0; i < 4; i++ ) 
+    framebuffer_t displayFbo = CreateFbo( &mainArena, 1024, 640, 4 ); // TODO: don't hardcode
+    FboClear( &displayFbo, 0x000000AA );
+    for( ;; ) 
     {
-        dut.a = tests[ i ].a;
-        dut.b = tests[ i ].b;
-        dut.eval();
-        trace.dump( tick++ );
+        // cycle the clock
+        display.clkPxl = 1;
+        display.eval();
+        display.clkPxl = 0;
+        display.eval();
 
-        if ( dut.y != tests[ i ].expected ) 
-        {
-            printf( "FAIL: %d NAND %d = %d (expected %d)\n", 
-                tests[i].a, tests[i].b, dut.y, tests[i].expected );
-            ++failures;
-        }
+        if( !WlPumpEvents( pWlCtx ) ) break;
+        
+
+        wl_fbo_t* pFbo = WlGetNextFramebuffer( pWlCtx );
+        if( !pFbo ) continue; // NOTE: shouldn't hit this case with 3+ fbos
+        // === YOUR RENDER HERE ===
+
+        FboCopyData( &pFbo->fbo, &displayFbo );
+
+        WlIssuePresent( pWlCtx, pFbo );
     }
 
+    display.final();
     trace.close();
 
-    if ( failures == 0 )
-    {
-        printf( "All tests passed!\n" );
-    } 
-    else
-    {
-        printf( "%d test(s) failed.\n", failures );
-    }
-    
-    return failures;
+    return 0;
 }

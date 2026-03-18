@@ -1,3 +1,4 @@
 build/
 obj/
-verilator/
+display_driver.sv
+display_driver/
