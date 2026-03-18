@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <cstring>
 #include <sys/mman.h>
+#include <poll.h>
 #include <unistd.h>
 
 #include <wayland-client.h>
@@ -17,11 +18,20 @@
 
 struct framebuffer_t
 {
-    wl_buffer* wlBuf;
-    u8*        data;
-    u32        busy;
+    wl_buffer*  wlBuf;
+    u8*         data;
+    u64         width       : 16;
+    u64         height      : 16;
+    u64         pixelPitch  : 8;
+    u64         busy        : 1;
+    u64         padding     : 23;
 };
 
+void FboClear( framebuffer_t* pFbo, u32 clearVal )
+{
+    u64 buffSz = pFbo->width * pFbo->pixelPitch * pFbo->height;
+    memset( pFbo->data, clearVal, buffSz );  
+}
 
 struct wl_context
 {
@@ -61,7 +71,6 @@ static const struct xdg_toplevel_listener xdgTopListener = {
 };
  
 // --- xdg_wm_base ping/pong (mandatory or compositor kills you) ---
- 
 static void XdgBasePing( void* data, xdg_wm_base* base, u32 serial ) 
 {
     xdg_wm_base_pong( base, serial );
@@ -77,7 +86,8 @@ static void WlRegGlobal( void* data, wl_registry* reg, u32 name, const char* ifa
 
     if( !strcmp( iface, wl_compositor_interface.name ) )
     {
-        wlCtx->compositor = ( wl_compositor* ) wl_registry_bind( reg, name, &wl_compositor_interface, 4 );
+        wlCtx->compositor = ( wl_compositor* ) wl_registry_bind( reg, name, 
+            &wl_compositor_interface, 4 );
     }
     else if( !strcmp( iface, wl_shm_interface.name ) )
     {
@@ -85,7 +95,8 @@ static void WlRegGlobal( void* data, wl_registry* reg, u32 name, const char* ifa
     }
     else if( !strcmp( iface, xdg_wm_base_interface.name ) )
     {
-        wlCtx->xdgBase = ( xdg_wm_base* ) wl_registry_bind( reg, name, &xdg_wm_base_interface, 1 );
+        wlCtx->xdgBase = ( xdg_wm_base* ) wl_registry_bind( reg, name, 
+            &xdg_wm_base_interface, 1 );
         xdg_wm_base_add_listener( wlCtx->xdgBase, &xdgBaseListener, NULL );
     }
 }
@@ -119,6 +130,9 @@ void WlInitCtx( wl_context* wlCtx )
     wlCtx->xdgTop  = xdg_surface_get_toplevel(wlCtx->xdgSurf);
     HT_ASSERT( wlCtx->xdgTop );
 
+    xdg_toplevel_set_title( wlCtx->xdgTop, "BFG");
+    xdg_toplevel_set_app_id( wlCtx->xdgTop, "BFG");
+
     xdg_toplevel_add_listener( wlCtx->xdgTop, &xdgTopListener, wlCtx );
  
     wl_surface_commit( wlCtx->surface );
@@ -130,7 +144,8 @@ void WlInitCtx( wl_context* wlCtx )
 // WL callbacks
 static void WlFramebufferRelease( void* data, wl_buffer* wlBuf )  
 {
-    ( ( framebuffer_t* ) data )->busy = 0;
+    framebuffer_t* fbo = ( framebuffer_t* ) data;
+    fbo->busy = 0;
 }
  
 static const wl_buffer_listener wlBuffListener = {
@@ -193,21 +208,41 @@ static void WlCreateFrameBuffers(
         HT_ASSERT( wlBuf );
 
         pWlCtx->fbos[ fboi ] = {
-            .wlBuf = wlBuf,
-            .data  = poolData + currOffsetInBytes,
-            .busy  = 0
+            .wlBuf      = wlBuf,
+            .data       = poolData + currOffsetInBytes,
+            .width      = width,
+            .height     = height,
+            .pixelPitch = pixelPitch,
+            .busy       = 0
         };
-        wl_buffer_add_listener( pWlCtx->fbos[ fboi ].wlBuf, &wlBuffListener, &pWlCtx->fbos[ fboi ] );
+        wl_buffer_add_listener( pWlCtx->fbos[ fboi ].wlBuf, &wlBuffListener, 
+            &pWlCtx->fbos[ fboi ] );
     }
 
     wl_shm_pool_destroy( wlPool );
     close( fileDesc );
 }
 
-bool WlPumpRequestsAndEvents( wl_context* pWlCtx )
+bool WlPumpEvents( wl_context* pWlCtx )
 {
+    // NOTE: dsipatch queued events 
+    while( 0 != wl_display_prepare_read( pWlCtx->display ) )
+    {
+        wl_display_dispatch_pending( pWlCtx->display );
+    }
+    pollfd fds = { .fd = wl_display_get_fd( pWlCtx->display ), .events = POLLIN };
+    if( poll( &fds, 1, 0 ) > 0 )
+    {
+        wl_display_read_events( pWlCtx->display );
+    }
+    else
+    {
+        wl_display_cancel_read( pWlCtx->display );
+    }
+        
+    // NOTE: dispatch what we just read
     wl_display_dispatch_pending( pWlCtx->display );
-    wl_display_flush( pWlCtx->display );
+    
     return pWlCtx->running;
 }
 
@@ -216,25 +251,21 @@ framebuffer_t* WlGetNextFramebuffer( wl_context* pWlCtx )
     for( u32 i = 0; i < pWlCtx->fboCount; i++ )
     {
         framebuffer_t& fbo = pWlCtx->fbos[ i ];
-        if ( !fbo.busy ) 
+        if( !fbo.busy ) 
         {
             return &fbo;
         }
     }
-        
+    return nullptr;
 }
 
 void WlIssuePresent( wl_context* pWlCtx, framebuffer_t* pFbo )
 {
     pFbo->busy = 1;
     wl_surface_attach( pWlCtx->surface, pFbo->wlBuf, 0, 0 );
-    wl_surface_damage_buffer( pWlCtx->surface, 0, 0, WIDTH, HEIGHT );
+    wl_surface_damage_buffer( pWlCtx->surface, 0, 0, pFbo->width, pFbo->height );
     wl_surface_commit( pWlCtx->surface );
-}
-
-static buffer_t *get_free_buffer(void) {
-    
-    return NULL;
+    wl_display_flush( pWlCtx->display );
 }
 
 struct nand_state
@@ -251,20 +282,20 @@ int main( i32 argc, char** argv )
     wl_context* pWlCtx = ArenaNew<wl_context>( mainArena );
     WlInitCtx( pWlCtx );
 
-    WlCreateFrameBuffers( pWlCtx, &mainArena, 1024, 640, WL_SHM_FORMAT_XBGR8888, 3 );
+    WlCreateFrameBuffers( pWlCtx, &mainArena, 1024, 640, WL_SHM_FORMAT_XRGB8888, 3 );
 
     for( ;; ) 
     {
-        if( !WlPumpRequestsAndEvents( pWlCtx ) ) break;
+        if( !WlPumpEvents( pWlCtx ) ) break;
         
 
         framebuffer_t* pFbo = WlGetNextFramebuffer( pWlCtx );
-        
+        if( nullptr == pFbo ) continue; // NOTE: shouldn't hit this case with 3+ fbos
         // === YOUR RENDER HERE ===
-        // write XRGB8888 pixels into buf->data, STRIDE bytes per row
-        memset(pFbo->data, 0x40, BUF_SIZE);  // placeholder: dark grey
- 
-       WlIssuePresent( pWlCtx,  );
+
+        FboClear( pFbo, 0x40 ); // placeholder: dark grey
+        
+        WlIssuePresent( pWlCtx, pFbo );
     }
 
     Verilated::commandArgs( argc, argv );
